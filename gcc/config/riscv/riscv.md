@@ -437,6 +437,110 @@
   [(set_attr "type" "arith")
    (set_attr "mode" "DI")])
 
+
+(define_insn "*adddi3_zext_rs1"
+  [(set (match_operand:DI          0 "register_operand" "=r,r")
+	(plus:DI (zero_extend:DI (match_operand:SI 1 "register_operand" " r,r"))
+		 (match_operand:DI 2 "arith_operand"    " r,I")))]
+  "TARGET_64BIT"
+  "@
+   .insn r 0x3b, 0x2, 0x0, %0, %1, %2
+   .insn i 0x1b, 0x2, %0, %1, %2"
+  [(set_attr "type" "arith")
+   (set_attr "mode" "DI")])
+
+(define_insn "*adddi3_zext_rs1_subreg"
+  [(set (match_operand:DI          0 "register_operand" "=r,r")
+	(plus:DI (zero_extend:DI (subreg:SI (match_operand:DI 1 "register_operand" " r,r") 0))
+		 (match_operand:DI 2 "arith_operand"    " r,I")))]
+  "TARGET_64BIT"
+  "@
+   .insn r 0x3b, 0x2, 0x0, %0, %1, %2
+   .insn i 0x1b, 0x2, %0, %1, %2"
+  [(set_attr "type" "arith")
+   (set_attr "mode" "DI")])
+
+(define_insn "*ashiftdi3_zext_rs1"
+  [(set (match_operand:DI          0 "register_operand" "=r,r")
+	(ashift:DI (zero_extend:DI (match_operand:SI 1 "register_operand" " r,r"))
+		 (match_operand:QI 2 "arith_operand"    " r,I")))]
+  "TARGET_64BIT"
+  "@
+   .insn r 0x3b, 0x6, 0x0, %0, %1, %2
+   .insn i 0x1b, 0x6, %0, %1, %2"
+  [(set_attr "type" "arith")
+   (set_attr "mode" "DI")])
+
+(define_insn "*ashiftdi3_zext_rs1_subreg"
+  [(set (match_operand:DI          0 "register_operand" "=r,r")
+	(ashift:DI (zero_extend:DI (subreg:SI (match_operand:DI 1 "register_operand" " r,r") 0))
+		 (match_operand:QI 2 "arith_operand"    " r,I")))]
+  "TARGET_64BIT"
+  "@
+   .insn r 0x3b, 0x6, 0x0, %0, %1, %2
+   .insn i 0x1b, 0x6, %0, %1, %2"
+  [(set_attr "type" "arith")
+   (set_attr "mode" "DI")])
+
+(define_insn "*ashiftdi3_zext_rs1_and"
+  [(set (match_operand:DI          0 "register_operand" "=r")
+	(and:DI
+	  (ashift:DI (match_operand:DI 1 "register_operand" " r")
+		 (match_operand:QI 2 "arith_operand"    " I"))
+	  (match_operand 3 "const_int_operand")))]
+  "TARGET_64BIT
+   && (INTVAL (operands[3]) >> ctz_hwi (INTVAL (operands[3]))) == 0xffffffffU
+   && INTVAL (operands[2]) == ctz_hwi (INTVAL (operands[3]))"
+  ".insn i 0x1b, 0x6, %0, %1, %2"
+  [(set_attr "type" "arith")
+   (set_attr "mode" "DI")])
+
+(define_insn "*addsi3_zext"
+  [(set (match_operand:DI          0 "register_operand" "=r,r")
+	(zero_extend:DI
+	  (plus:SI (match_operand:SI 1 "register_operand" " r,r")
+		   (match_operand:SI 2 "arith_operand"    " r,I"))))]
+  "TARGET_64BIT"
+  "@
+   .insn r 0x3b, 0x3, 0x0, %0, %1, %2
+   .insn i 0x1b, 0x3, %0, %1, %2"
+  [(set_attr "type" "arith")
+   (set_attr "mode" "DI")])
+
+(define_insn "*addsi3_zext2"
+  [(set (match_operand:DI                       0 "register_operand" "=r,r")
+	(zero_extend:DI
+	  (subreg:SI (plus:DI (match_operand:DI 1 "register_operand" " r,r")
+			      (match_operand:DI 2 "arith_operand"    " r,I"))
+		     0)))]
+  "TARGET_64BIT"
+  "@
+   .insn r 0x3b, 0x3, 0x0, %0, %1, %2
+   .insn i 0x1b, 0x3, %0, %1, %2"
+  [(set_attr "type" "arith")
+   (set_attr "mode" "SI")])
+
+(define_insn "*subsi3_zext"
+  [(set (match_operand:DI          0 "register_operand" "=r")
+	(zero_extend:DI
+	  (minus:SI (match_operand:SI 1 "register_operand" " r")
+		   (match_operand:SI 2 "arith_operand"    " r"))))]
+  "TARGET_64BIT"
+  ".insn r 0x3b, 0x3, 0x20, %0, %1, %2"
+  [(set_attr "type" "arith")
+   (set_attr "mode" "DI")])
+
+(define_insn "*subsi3_zext2"
+  [(set (match_operand:DI                       0 "register_operand" "=r")
+	(zero_extend:DI
+	  (subreg:SI (minus:DI (match_operand:DI 1 "register_operand" " r")
+			      (match_operand:DI 2 "arith_operand"    " r"))
+		     0)))]
+  "TARGET_64BIT"
+  ".insn r 0x3b, 0x3, 0x20, %0, %1, %2"
+  [(set_attr "type" "arith")
+   (set_attr "mode" "SI")])
+
 (define_insn "*addsi3_extended"
   [(set (match_operand:DI               0 "register_operand" "=r,r")
 	(sign_extend:DI
@@ -1027,21 +1131,15 @@
 
 ;; Extension insns.
 
-(define_insn_and_split "zero_extendsidi2"
+(define_insn "zero_extendsidi2"
   [(set (match_operand:DI     0 "register_operand"     "=r,r")
 	(zero_extend:DI
 	    (match_operand:SI 1 "nonimmediate_operand" " r,m")))]
   "TARGET_64BIT"
   "@
-   #
+   .insn r 0x3b, 0x3, 0x0, %0, %1, x0
    lwu\t%0,%1"
-  "&& reload_completed && REG_P (operands[1])"
-  [(set (match_dup 0)
-	(ashift:DI (match_dup 1) (const_int 32)))
-   (set (match_dup 0)
-	(lshiftrt:DI (match_dup 0) (const_int 32)))]
-  { operands[1] = gen_lowpart (DImode, operands[1]); }
-  [(set_attr "move_type" "shift_shift,load")
+  [(set_attr "move_type" "move,load")
    (set_attr "mode" "DI")])
 
 (define_insn_and_split "zero_extendhi<GPR:mode>2"
@@ -1644,6 +1742,65 @@
   [(set_attr "type" "shift")
    (set_attr "mode" "DI")])
 
+;;t (define_insn "*ashlsi3_extend"
+;;  [(set (match_operand:DI                   0 "register_operand" "= r")
+;;	(zero_extend:DI
+;;	    (ashift:SI (match_operand:SI 1 "register_operand" "  r")
+;;			  (match_operand:QI 2 "arith_operand"    " rI"))))]
+;;  "TARGET_64BIT"
+;;{
+;;  if (GET_CODE (operands[2]) == CONST_INT)
+;;    operands[2] = GEN_INT (INTVAL (operands[2]) & 0x1f);
+;;
+;;  return REG_P (operands[2]) ? ".insn r 0x3b, 0x7, 0x0, %0, %1, %2" : ".insn i 0x1b, 0x7, %0, %1, %2";
+;;}
+;;  [(set_attr "type" "shift")
+;;   (set_attr "mode" "SI")])
+;;
+;;(define_insn_and_split "*ashlsi3_extend_mask"
+;;  [(set (match_operand:DI                   0 "register_operand" "= r")
+;;	(zero_extend:DI
+;;	    (ashift:SI
+;;	     (match_operand:SI 1 "register_operand" "  r")
+;;	     (subreg:QI
+;;	      (and:SI
+;;	       (match_operand:SI 2 "register_operand" " r")
+;;	       (match_operand 3 "const_int_operand")) 0))))]
+;;  "TARGET_64BIT
+;;   && (INTVAL (operands[3]) & (GET_MODE_BITSIZE (SImode)-1))
+;;       == GET_MODE_BITSIZE (SImode)-1"
+;;  "#"
+;;  "&& 1"
+;;  [(set (match_dup 0)
+;;	(zero_extend:DI
+;;	 (ashift:SI (match_dup 1)
+;;		       (match_dup 2))))]
+;;  "operands[2] = gen_lowpart (QImode, operands[2]);"
+;;  [(set_attr "type" "shift")
+;;   (set_attr "mode" "SI")])
+;;
+;;(define_insn_and_split "*ashlsi3_extend_mask_1"
+;;  [(set (match_operand:DI                   0 "register_operand" "= r")
+;;	(zero_extend:DI
+;;	    (ashift:SI
+;;	     (match_operand:SI 1 "register_operand" "  r")
+;;	     (subreg:QI
+;;	      (and:DI
+;;	       (match_operand:DI 2 "register_operand" " r")
+;;	       (match_operand 3 "const_int_operand")) 0))))]
+;;  "TARGET_64BIT
+;;   && (INTVAL (operands[3]) & (GET_MODE_BITSIZE (SImode)-1))
+;;       == GET_MODE_BITSIZE (SImode)-1"
+;;  "#"
+;;  "&& 1"
+;;  [(set (match_dup 0)
+;;	(zero_extend:DI
+;;	 (ashift:SI (match_dup 1)
+;;		       (match_dup 2))))]
+;;  "operands[2] = gen_lowpart (QImode, operands[2]);"
+;;  [(set_attr "type" "shift")
+;;   (set_attr "mode" "SI")])
+
 (define_insn "*<optab>si3_extend"
   [(set (match_operand:DI                   0 "register_operand" "= r")
 	(sign_extend:DI
@@ -1700,6 +1857,15 @@
 	 (any_shift:SI (match_dup 1)
 		       (match_dup 2))))]
   "operands[2] = gen_lowpart (QImode, operands[2]);"
+  [(set_attr "type" "shift")
+   (set_attr "mode" "SI")])
+
+(define_insn "*lshrsi3_zero_extend_1"
+  [(set (match_operand:DI                   0 "register_operand" "=r")
+	 (ashift:DI (zero_extend:DI (match_operand:SI     1 "register_operand" " r"))
+		      (match_operand        2 "const_int_operand")))]
+  "TARGET_64BIT && IN_RANGE (INTVAL (operands[2]), 32, 63)"
+  "slli\t%0,%1,%2"
   [(set_attr "type" "shift")
    (set_attr "mode" "SI")])
 
@@ -1776,6 +1942,22 @@
 	(ashift:DI (match_dup 0) (match_dup 2)))]
 {
   operands[2] = GEN_INT (ctz_hwi (INTVAL (operands[2])));
+})
+
+(define_split
+  [(set (match_operand:DI 0 "register_operand")
+	(and:DI (ashift:DI (match_operand:DI 1 "register_operand") (match_operand 2 "const_int_operand"))
+		(match_operand:DI 3 "const_int_operand")))]
+  "TARGET_64BIT"
+  [(set (match_dup 0)
+	(ashift:DI (zero_extend:DI (subreg:SI (match_dup 1) 0)) (match_dup 2)))]
+{
+  if (!REG_P (operands[1]))
+    FAIL;
+  if ((INTVAL (operands[3]) >> ctz_hwi (INTVAL (operands[3]))) != 0xffffffffU)
+    FAIL;
+  if (ctz_hwi (INTVAL (operands[3])) != INTVAL (operands[2]))
+    FAIL;
 })
 
 ;;

@@ -21,6 +21,19 @@
 ;; Simplify (unsigned long)(unsigned int)a << const
 (define_peephole2
   [(set (match_operand:DI 0 "register_operand")
+	(zero_extend:DI (match_operand:SI 1 "register_operand")))
+   (set (match_operand:DI 2 "register_operand")
+	(ashift:DI (match_dup 0) (match_operand 3 "const_int_operand")))]
+  "TARGET_64BIT
+   && INTVAL (operands[3]) < 32
+   && (REGNO (operands[0]) == REGNO (operands[2])
+       || peep2_reg_dead_p (2, operands[0]))"
+  [(set (match_dup 0)
+	(ashift:DI (zero_extend:DI (match_dup 1)) (match_dup 3)))])
+
+;; Simplify (unsigned long)(unsigned int)a << const
+(define_peephole2
+  [(set (match_operand:DI 0 "register_operand")
 	(ashift:DI (match_operand:DI 1 "register_operand")
 		   (match_operand 2 "const_int_operand")))
    (set (match_operand:DI 3 "register_operand")
@@ -29,6 +42,51 @@
 	(ashift:DI (match_dup 3) (match_operand 5 "const_int_operand")))]
   "TARGET_64BIT
    && INTVAL (operands[5]) < INTVAL (operands[2])
+   && INTVAL (operands[2]) == 32
+   && (REGNO (operands[0]) == REGNO (operands[4])
+       || peep2_reg_dead_p (2, operands[0]))
+   && (REGNO (operands[3]) == REGNO (operands[4])
+       || peep2_reg_dead_p (3, operands[3]))"
+  [(set (match_dup 0)
+	(ashift:DI (zero_extend:DI (subreg:SI (match_dup 1) 0)) (match_dup 5)))])
+
+;; Simplify (unsigned long)(unsigned int)a << const
+(define_peephole2
+  [(set (match_operand:DI 0 "register_operand")
+	(zero_extend:DI (match_operand:SI 1 "register_operand")))
+   (set (match_operand:DI 2 "register_operand")
+	(ashift:DI (match_dup 0) (match_operand 3 "const_int_operand")))]
+  "TARGET_64BIT
+   && INTVAL (operands[3]) < 32
+   && (REGNO (operands[0]) == REGNO (operands[2])
+       || peep2_reg_dead_p (2, operands[0]))"
+  [(set (match_dup 0)
+	(ashift:DI (zero_extend:DI (match_dup 1)) (const_int 32)))
+   (set (match_dup 2)
+	(lshiftrt:DI (match_dup 0) (match_operand 3)))]
+{
+  operands[3] = GEN_INT (32 - INTVAL (operands[3]));
+})
+
+
+;; Simplify (unsigned long)(unsigned int)a << const
+(define_peephole2
+  [(set (match_operand:DI 0 "register_operand")
+	(ashift:DI (match_operand:DI 1 "register_operand")
+		   (match_operand 2 "const_int_operand")))
+   (set (match_operand:DI 3 "register_operand")
+	(lshiftrt:DI (match_dup 0) (match_dup 2)))
+   (set (match_operand:DI 4 "register_operand")
+	(ashift:DI (match_dup 3) (match_operand 5 "const_int_operand")))]
+;;  "TARGET_64BIT
+;;   && INTVAL (operands[5]) < INTVAL (operands[2])
+;;   && (REGNO (operands[3]) == REGNO (operands[4])
+;;       || peep2_reg_dead_p (3, operands[3]))"
+  "TARGET_64BIT
+   && INTVAL (operands[5]) < INTVAL (operands[2])
+   && !(INTVAL (operands[2]) == 32
+	&& (REGNO (operands[0]) == REGNO (operands[4])
+	    || peep2_reg_dead_p (2, operands[0])))
    && (REGNO (operands[3]) == REGNO (operands[4])
        || peep2_reg_dead_p (3, operands[3]))"
   [(set (match_dup 0)
