@@ -353,9 +353,9 @@ static const struct attribute_spec riscv_attribute_table[] =
     riscv_handle_type_attribute, NULL },
 
   /* TODO: add PULP attributes */
-  /* { "tiny",           0, 0, true,  false, false, NULL, true  }, */
+  { "tiny", 0, 0, true,  false, false, NULL, NULL },
   /* The last attribute spec is set to be NULL.  */
-  { NULL,	0,  0, false, false, false, false, NULL, NULL }
+  { NULL,	0, 0, false, false, false, false, NULL, NULL }
 };
 
 /* A table describing all the processors GCC knows about.  */
@@ -2453,7 +2453,7 @@ riscv_emit_int_compare (enum rtx_code *code, rtx *op0, rtx *op1)
   if (*op1 != const0_rtx) {
     /* Only force op1 into a registers if it can't be used as a small constant
        in th p.b{eq,ne}imm PULP branch */
-     if (!((Pulp_Cpu>=PULP_V2) && (*code == EQ || *code == NE) && (GET_CODE(*op1) == CONST_INT) && (INTVAL(*op1) >= -16) && (INTVAL(*op1) <= 15))) 
+     if (!((Pulp_Cpu>=PULP_V2) && (*code == EQ || *code == NE) && (GET_CODE(*op1) == CONST_INT) && (INTVAL(*op1) >= -16) && (INTVAL(*op1) <= 15)))
     	*op1 = force_reg (word_mode, *op1);
   }
 }
@@ -5813,9 +5813,9 @@ hwloop_optimize (hwloop_info loop)
 	fprintf(dump_file, "head         : bb%d\n", loop->head->index);
 	fprintf(dump_file, "incoming_src : bb%d\n", loop->incoming_src?loop->incoming_src->index:-5555);
 	fprintf(dump_file, "incoming_dest: bb%d\n", loop->incoming_dest?loop->incoming_dest->index:-5555);
-	for (i = 0; vec_safe_iterate(loop->incoming, i, &e); i++) 
+	for (i = 0; vec_safe_iterate(loop->incoming, i, &e); i++)
 		fprintf(dump_file, " Incoming: src= bb%4d, dest= bb%4d, Edge is: %s\n", e->src->index, e->dest->index, (e->flags & EDGE_FALLTHRU)?"Fall Through":"Branch");
-	
+
   }
   if (loop->depth > MAX_LOOP_DEPTH)
     {
@@ -6117,7 +6117,7 @@ hwloop_optimize (hwloop_info loop)
 							single_def_iter = NULL; break;
 						}
 					}
-					
+
 				}
 			if (!single_def_iter) {
 				if (dump_file) {
@@ -6213,7 +6213,7 @@ hwloop_optimize (hwloop_info loop)
 	} else {
 		/* Use short form:
 			lp.counti level, end_label, iter_reg
-			
+
 			immediate(iter_reg) and 0 <= imm_value <= 2047 and loop->length <= 31
 				we can use lp.counti level, loop_end, imm_value
 		*/
