@@ -440,6 +440,7 @@ riscv_is_supported_pulp_ext (const char *ext)
     "xpulpclip",
     "xpulpaddsubrn",
     "xpulpelw",
+    "xfvecsingle",
     NULL
   };
 
@@ -738,6 +739,10 @@ riscv_parse_arch_string (const char *isa, int *flags, int *pulp_flags,
   *pulp_flags &= ~OPTION_MASK_PULP_ELW;
   if (subset_list->lookup("xpulpelw"))
     *pulp_flags |= OPTION_MASK_PULP_ELW;
+
+  *pulp_flags &= ~OPTION_MASK_PULP_FVECSINGLE;
+  if (subset_list->lookup("xfvecsingle"))
+    *pulp_flags |= OPTION_MASK_PULP_FVECSINGLE;
 
   /* groupings using the above listed subsets */
 #define PULP_EXT_GROUP_SMALL (OPTION_MASK_PULP_POSTMOD		\

@@ -289,6 +289,9 @@ mpulp-compat
 Target Mask(PULP_COMPAT) Var(pulp_target_flags)
 Use PULP extension instructions (if any) in pulpv0 and pulpv1 compatibility mode. This changes the instruction encoding (postmod) and instructions themselves (avg instead of addn). Use only if you know what you do.
 
+mpulp-fvecsingle
+Target Mask(PULP_FVECSINGLE) Var(pulp_target_flags) Undocumented
+
 mno-finduct
 Target RejectNegative Mask(NOFINDUCT) Var(pulp_target_flags_override)
 Disable cost function setting to favor induction scheme

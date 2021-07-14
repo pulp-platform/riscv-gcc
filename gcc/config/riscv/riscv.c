@@ -2865,6 +2865,8 @@ static bool riscv_vector_mode_supported_p (machine_mode mode)
     case E_V4QImode:
     case E_V2QImode:
       return TARGET_PULP_VECT;
+    case E_V2SFmode:
+      return TARGET_PULP_FVECSINGLE;
     default:
       return false;
     }
@@ -5040,7 +5042,8 @@ riscv_hard_regno_mode_ok (unsigned int regno, machine_mode mode)
 	return false;
 
       if (GET_MODE_CLASS (mode) != MODE_FLOAT
-	  && GET_MODE_CLASS (mode) != MODE_COMPLEX_FLOAT)
+	  && GET_MODE_CLASS (mode) != MODE_COMPLEX_FLOAT
+	  && GET_MODE_CLASS (mode) != MODE_VECTOR_FLOAT)
 	return false;
 
       /* Only use callee-saved registers if a potential callee is guaranteed

@@ -189,7 +189,7 @@
   (const_string "unknown"))
 
 ;; Main data type used by the insn
-(define_attr "mode" "unknown,none,QI,HI,SI,DI,TI,SF,DF,TF,V2HI,V2QI,V4QI"
+(define_attr "mode" "unknown,none,QI,HI,SI,DI,TI,SF,DF,TF,V2HI,V2QI,V4QI,V2SF"
   (const_string "unknown"))
 
 ;; True if the main data type is twice the size of a word.
@@ -348,7 +348,7 @@
 (define_mode_iterator SUBDI [QI HI SI])
 
 ;; 64-bit modes for which we provide move patterns.
-(define_mode_iterator MOVE64 [DI DF])
+(define_mode_iterator MOVE64 [DI DF V2SF])
 
 ;; Iterator for sub-32-bit integer modes.
 (define_mode_iterator SHORT [QI HI])
@@ -1560,6 +1560,27 @@
   { return riscv_output_move (operands[0], operands[1]); }
   [(set_attr "move_type" "move,const,load,store")
    (set_attr "mode" "V4QI")])
+
+;; 32-bit v2sf vector moves
+;; TODO: TARGET_PULP_VECT IS WRONG
+(define_expand "movv2sf"
+  [(set (match_operand:V2SF 0 "")
+	(match_operand:V2SF 1 ""))]
+  "TARGET_PULP_FVECSINGLE"
+{
+  if (riscv_legitimize_move (V2SFmode, operands[0], operands[1]))
+    DONE;
+})
+
+(define_insn "*movv2sf_rv32"
+  [(set (match_operand:V2SF 0 "nonimmediate_operand" "=f,f,f,m,m,  *r,*r,*m")
+	(match_operand:V2SF 1 "move_operand"         " f,G,m,f,G,*r*G,*m,*r"))]
+  "TARGET_PULP_FVECSINGLE && !TARGET_64BIT && TARGET_DOUBLE_FLOAT
+   && (register_operand (operands[0], V2SFmode)
+       || reg_or_0_operand (operands[1], V2SFmode))"
+  { return riscv_output_move (operands[0], operands[1]); }
+  [(set_attr "move_type" "fmove,mtc,fpload,fpstore,store,move,load,store")
+   (set_attr "mode" "V2SF")])
 
 ;; TODO: somehow this allows the memmove in memmove-4.c to be inlined resulting
 ;; in a XPASS. This pattern is also used by the autovectorizer
