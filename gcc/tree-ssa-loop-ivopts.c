@@ -1,6 +1,5 @@
-/* Induction variable optimizations.
-   Copyright (C) 2003-2019 Free Software Foundation, Inc.
-
+	/* Induction variable optimizations.
+   Copyright (C) 2003-2020 Free Software Foundation, Inc.
 This file is part of GCC.
 
 GCC is free software; you can redistribute it and/or modify it
@@ -64,7 +63,27 @@ along with GCC; see the file COPYING3.  If not see
    All of this is done loop by loop.  Doing it globally is theoretically
    possible, it might give a better performance and it might enable us
    to decide costs more precisely, but getting all the interactions right
-   would be complicated.  */
+   would be complicated.
+
+   For the targets supporting low-overhead loops, IVOPTs has to take care of
+   the loops which will probably be transformed in RTL doloop optimization,
+   to try to make selected IV candidate set optimal.  The process of doloop
+   support includes:
+   1) Analyze the current loop will be transformed to doloop or not, find and
+      mark its compare type IV use as doloop use (iv_group field doloop_p), and
+      set flag doloop_use_p of ivopts_data to notify subsequent processings on
+      doloop.  See analyze_and_mark_doloop_use and its callees for the details.
+      The target hook predict_doloop_p can be used for target specific checks.
+   2) Add one doloop dedicated IV cand {(may_be_zero ? 1 : (niter + 1)), +, -1},
+      set flag doloop_p of iv_cand, step cost is set as zero and no extra cost
+      like biv.  For cost determination between doloop IV cand and IV use, the
+      target hooks doloop_cost_for_generic and doloop_cost_for_address are
+      provided to add on extra costs for generic type and address type IV use.
+      Zero cost is assigned to the pair between doloop IV cand and doloop IV
+      use, and bound zero is set for IV elimination.
+   3) With the cost setting in step 2), the current cost model based IV
+      selection algorithm will process as usual, pick up doloop dedicated IV if
+      profitable.  */
 
 #include "config.h"
 #include "system.h"
@@ -108,13 +127,17 @@ along with GCC; see the file COPYING3.  If not see
 #include "tree-ssa-address.h"
 #include "builtins.h"
 #include "tree-vectorizer.h"
+#include "dbgcnt.h"
+
+/* For lang_hooks.types.type_for_mode.  */
+#include "langhooks.h"
 
 /* FIXME: Expressions are expanded to RTL in this pass to determine the
    cost of different addressing modes.  This should be moved to a TBD
    interface between the GIMPLE and RTL worlds.  */
 
 /* The infinite cost.  */
-#define INFTY 10000000
+#define INFTY 1000000000
 
 /* Returns the expected number of loop iterations for LOOP.
    The average trip count is computed from profile data if it
@@ -180,7 +203,7 @@ struct comp_cost
   comp_cost (): cost (0), complexity (0), scratch (0)
   {}
 
-  comp_cost (int cost, unsigned complexity, int scratch = 0)
+  comp_cost (int64_t cost, unsigned complexity, int64_t scratch = 0)
     : cost (cost), complexity (complexity), scratch (scratch)
   {}
 
@@ -220,16 +243,16 @@ struct comp_cost
   /* Returns true if COST1 is smaller or equal than COST2.  */
   friend bool operator<= (comp_cost cost1, comp_cost cost2);
 
-  int cost;		/* The runtime cost.  */
+  int64_t cost;		/* The runtime cost.  */
   unsigned complexity;  /* The estimate of the complexity of the code for
 			   the computation (in no concrete units --
 			   complexity field should be larger for more
 			   complex expressions and addressing modes).  */
-  int scratch;		/* Scratch used during cost computation.  */
+  int64_t scratch;	/* Scratch used during cost computation.  */
 };
 
 static const comp_cost no_cost;
-static const comp_cost infinite_cost (INFTY, INFTY, INFTY);
+static const comp_cost infinite_cost (INFTY, 0, INFTY);
 
 bool
 comp_cost::infinite_cost_p ()
@@ -243,6 +266,7 @@ operator+ (comp_cost cost1, comp_cost cost2)
   if (cost1.infinite_cost_p () || cost2.infinite_cost_p ())
     return infinite_cost;
 
+  gcc_assert (cost1.cost + cost2.cost < infinite_cost.cost);
   cost1.cost += cost2.cost;
   cost1.complexity += cost2.complexity;
 
@@ -256,6 +280,7 @@ operator- (comp_cost cost1, comp_cost cost2)
     return infinite_cost;
 
   gcc_assert (!cost2.infinite_cost_p ());
+  gcc_assert (cost1.cost - cost2.cost < infinite_cost.cost);
 
   cost1.cost -= cost2.cost;
   cost1.complexity -= cost2.complexity;
@@ -273,9 +298,13 @@ comp_cost::operator+= (comp_cost cost)
 comp_cost
 comp_cost::operator+= (HOST_WIDE_INT c)
 {
+  if (c >= INFTY)
+    this->cost = INFTY;
+
   if (infinite_cost_p ())
     return *this;
 
+  gcc_assert (this->cost + c < infinite_cost.cost);
   this->cost += c;
 
   return *this;
@@ -287,6 +316,7 @@ comp_cost::operator-= (HOST_WIDE_INT c)
   if (infinite_cost_p ())
     return *this;
 
+  gcc_assert (this->cost - c < infinite_cost.cost);
   this->cost -= c;
 
   return *this;
@@ -295,6 +325,7 @@ comp_cost::operator-= (HOST_WIDE_INT c)
 comp_cost
 comp_cost::operator/= (HOST_WIDE_INT c)
 {
+  gcc_assert (c != 0);
   if (infinite_cost_p ())
     return *this;
 
@@ -309,6 +340,7 @@ comp_cost::operator*= (HOST_WIDE_INT c)
   if (infinite_cost_p ())
     return *this;
 
+  gcc_assert (this->cost * c < infinite_cost.cost);
   this->cost *= c;
 
   return *this;
@@ -393,6 +425,8 @@ struct iv_group
   struct cost_pair *cost_map;
   /* The selected candidate for the group.  */
   struct iv_cand *selected;
+  /* To indicate this is a doloop use group.  */
+  bool doloop_p;
   /* Uses in the group.  */
   vec<struct iv_use *> vuses;
 };
@@ -433,6 +467,7 @@ struct iv_cand
 			   be hoisted out of loop.  */
   struct iv *orig_iv;	/* The original iv if this cand is added from biv with
 			   smaller type.  */
+  bool doloop_p;	/* Whether this is a doloop candidate.  */
 };
 
 /* Hashtable entry for common candidate derived from iv uses.  */
@@ -609,6 +644,9 @@ struct ivopts_data
 
   /* Whether the loop body can only be exited via single exit.  */
   bool loop_single_exit_p;
+
+  /* Whether the loop has doloop comparison use.  */
+  bool doloop_use_p;
 };
 
 /* An assignment of iv candidates to uses.  */
@@ -641,7 +679,7 @@ struct iv_ca
   comp_cost cand_use_cost;
 
   /* Total cost of candidates.  */
-  unsigned cand_cost;
+  int64_t cand_cost;
 
   /* Number of times each invariant variable is used.  */
   unsigned *n_inv_var_uses;
@@ -1274,7 +1312,11 @@ get_iv (struct ivopts_data *data, tree var)
 
       if (!bb
 	  || !flow_bb_inside_loop_p (data->current_loop, bb))
-	set_iv (data, var, var, build_int_cst (type, 0), true);
+	{
+	  if (POINTER_TYPE_P (type))
+	    type = sizetype;
+	  set_iv (data, var, var, build_int_cst (type, 0), true);
+	}
     }
 
   return name_info (data, var)->iv;
@@ -1340,7 +1382,6 @@ find_bivs (struct ivopts_data *data)
       /* Stop expanding iv base at the first ssa var referred by iv step.
 	 Ideally we should stop at any ssa var, because that's expensive
 	 and unusual to happen, we just do it on the first one.
-
 	 See PR64705 for the rationale.  */
       stop = extract_single_var_from_expr (step);
       base = expand_simple_operations (base, stop);
@@ -1439,7 +1480,6 @@ find_givs_in_stmt_scev (struct ivopts_data *data, gimple *stmt, affine_iv *iv)
   /* Stop expanding iv base at the first ssa var referred by iv step.
      Ideally we should stop at any ssa var, because that's expensive
      and unusual to happen, we just do it on the first one.
-
      See PR64705 for the rationale.  */
   stop = extract_single_var_from_expr (iv->step);
   iv->base = expand_simple_operations (iv->base, stop);
@@ -1602,6 +1642,7 @@ record_group (struct ivopts_data *data, enum use_type type)
   group->type = type;
   group->related_cands = BITMAP_ALLOC (NULL);
   group->vuses.create (1);
+  group->doloop_p = false;
 
   data->vgroups.safe_push (group);
   return group;
@@ -2550,11 +2591,8 @@ find_interesting_uses_stmt (struct ivopts_data *data, gimple *stmt)
 	}
 
       /* TODO -- we should also handle address uses of type
-
 	 memory = call (whatever);
-
 	 and
-
 	 call (memory).  */
     }
 
@@ -2648,12 +2686,10 @@ group_compare_offset (const void *a, const void *b)
 /* Check if small groups should be split.  Return true if no group
    contains more than two uses with distinct addr_offsets.  Return
    false otherwise.  We want to split such groups because:
-
      1) Small groups don't have much benefit and may interfer with
 	general candidate selection.
      2) Size for problem with only small groups is usually small and
 	general algorithm can handle it well.
-
    TODO -- Above claim may not hold when we want to merge memory
    accesses with conseuctive addresses.  */
 
@@ -3015,7 +3051,10 @@ find_inv_vars_cb (tree *expr_p, int *ws ATTRIBUTE_UNUSED, void *data)
 
       if (!bb || !flow_bb_inside_loop_p (idata->current_loop, bb))
 	{
-	  set_iv (idata, op, op, build_int_cst (TREE_TYPE (op), 0), true);
+	  tree steptype = TREE_TYPE (op);
+	  if (POINTER_TYPE_P (steptype))
+	    steptype = sizetype;
+	  set_iv (idata, op, op, build_int_cst (steptype, 0), true);
 	  record_invariant (idata, op, false);
 	}
     }
@@ -3091,10 +3130,10 @@ get_loop_invariant_expr (struct ivopts_data *data, tree inv_expr)
    replacement of the final value of the iv by a direct computation.  */
 
 static struct iv_cand *
-add_candidate_1 (struct ivopts_data *data,
-		 tree base, tree step, bool important, enum iv_position pos,
-		 struct iv_use *use, gimple *incremented_at,
-		 struct iv *orig_iv = NULL)
+add_candidate_1 (struct ivopts_data *data, tree base, tree step, bool important,
+		 enum iv_position pos, struct iv_use *use,
+		 gimple *incremented_at, struct iv *orig_iv = NULL,
+		 bool doloop = false)
 {
   unsigned i;
   struct iv_cand *cand = NULL;
@@ -3153,11 +3192,16 @@ add_candidate_1 (struct ivopts_data *data,
       cand->pos = pos;
       if (pos != IP_ORIGINAL)
 	{
+	  if (doloop)
+	    cand->var_before = create_tmp_var_raw (TREE_TYPE (base), "doloop");
+	  else
+	    cand->var_before = create_tmp_var_raw (TREE_TYPE (base), "ivtmp");
 	  cand->var_before = create_tmp_var_raw (TREE_TYPE (base), "ivtmp");
 	  cand->var_after = cand->var_before;
 	}
       cand->important = important;
       cand->incremented_at = incremented_at;
+      cand->doloop_p = doloop;
       data->vcands.safe_push (cand);
 
       if (!poly_int_tree_p (step))
@@ -3190,6 +3234,7 @@ add_candidate_1 (struct ivopts_data *data,
     }
 
   cand->important |= important;
+  cand->doloop_p |= doloop;
 
   /* Relate candidate to the group for which it is added.  */
   if (use)
@@ -3200,7 +3245,6 @@ add_candidate_1 (struct ivopts_data *data,
 
 /* Returns true if incrementing the induction variable at the end of the LOOP
    is allowed.
-
    The purpose is to avoid splitting latch edge with a biv increment, thus
    creating a jump, possibly confusing other optimization passes and leaving
    less freedom to scheduler.  So we allow IP_END only if IP_NORMAL is not
@@ -3283,14 +3327,16 @@ add_autoinc_candidates (struct ivopts_data *data, tree base, tree step,
    the end of loop.  */
 
 static void
-add_candidate (struct ivopts_data *data,
-	       tree base, tree step, bool important, struct iv_use *use,
-	       struct iv *orig_iv = NULL)
+add_candidate (struct ivopts_data *data, tree base, tree step, bool important,
+	       struct iv_use *use, struct iv *orig_iv = NULL,
+	       bool doloop = false)
 {
   if (ip_normal_pos (data->current_loop))
-    add_candidate_1 (data, base, step, important,
-		     IP_NORMAL, use, NULL, orig_iv);
-  if (ip_end_pos (data->current_loop)
+    add_candidate_1 (data, base, step, important, IP_NORMAL, use, NULL, orig_iv,
+		     doloop);
+  /* Exclude doloop candidate here since it requires decrement then comparison
+     and jump, the IP_END position doesn't match.  */
+  if (!doloop && ip_end_pos (data->current_loop)
       && allow_ip_end_pos_p (data->current_loop))
     add_candidate_1 (data, base, step, important, IP_END, use, NULL, orig_iv);
 }
@@ -3490,8 +3536,21 @@ add_iv_candidate_for_use (struct ivopts_data *data, struct iv_use *use)
 {
   poly_uint64 offset;
   tree base;
-  tree basetype;
   struct iv *iv = use->iv;
+  tree basetype = TREE_TYPE (iv->base);
+
+  /* Don't add candidate for iv_use with non integer, pointer or non-mode
+     precision types, instead, add candidate for the corresponding scev in
+     unsigned type with the same precision.  See PR93674 for more info.  */
+  if ((TREE_CODE (basetype) != INTEGER_TYPE && !POINTER_TYPE_P (basetype))
+      || !type_has_mode_precision_p (basetype))
+    {
+      basetype = lang_hooks.types.type_for_mode (TYPE_MODE (basetype),
+						 TYPE_UNSIGNED (basetype));
+      add_candidate (data, fold_convert (basetype, iv->base),
+		     fold_convert (basetype, iv->step), false, NULL);
+      return;
+    }
 
   add_candidate (data, iv->base, iv->step, false, use);
 
@@ -3786,6 +3845,61 @@ prepare_decl_rtl (tree *expr_p, int *ws, void *data)
   return NULL_TREE;
 }
 
+/* Predict whether the given loop will be transformed in the RTL
+   doloop_optimize pass.  Attempt to duplicate some doloop_optimize checks.
+   This is only for target independent checks, see targetm.predict_doloop_p
+   for the target dependent ones.
+   Note that according to some initial investigation, some checks like costly
+   niter check and invalid stmt scanning don't have much gains among general
+   cases, so keep this as simple as possible first.
+   Some RTL specific checks seems unable to be checked in gimple, if any new
+   checks or easy checks _are_ missing here, please add them.  */
+
+static bool
+generic_predict_doloop_p (struct ivopts_data *data)
+{
+  struct loop *loop = data->current_loop;
+
+  /* Call target hook for target dependent checks.  */
+  if (!targetm.predict_doloop_p (loop))
+    {
+      if (dump_file && (dump_flags & TDF_DETAILS))
+	fprintf (dump_file, "Predict doloop failure due to"
+			    " target specific checks.\n");
+      return false;
+    }
+
+  /* Similar to doloop_optimize, check iteration description to know it's
+     suitable or not.  Keep it as simple as possible, feel free to extend it
+     if you find any multiple exits cases matter.  */
+  edge exit = single_dom_exit (loop);
+  struct tree_niter_desc *niter_desc;
+  if (!exit || !(niter_desc = niter_for_exit (data, exit)))
+    {
+      if (dump_file && (dump_flags & TDF_DETAILS))
+	fprintf (dump_file, "Predict doloop failure due to"
+			    " unexpected niters.\n");
+      return false;
+    }
+
+  /* Similar to doloop_optimize, check whether iteration count too small
+     and not profitable.  */
+  HOST_WIDE_INT est_niter = get_estimated_loop_iterations_int (loop);
+  if (est_niter == -1)
+    est_niter = get_likely_max_loop_iterations_int (loop);
+  if (est_niter >= 0 && est_niter < 3)
+    {
+      if (dump_file && (dump_flags & TDF_DETAILS))
+	fprintf (dump_file,
+		 "Predict doloop failure due to"
+		 " too few iterations (%u).\n",
+		 (unsigned int) est_niter);
+      return false;
+    }
+
+  return true;
+}
+
 /* Determines cost of the computation of EXPR.  */
 
 static unsigned
@@ -4035,16 +4149,16 @@ get_computation_at (struct loop *loop, gimple *at,
    if we're optimizing for speed, amortize it over the per-iteration cost.
    If ROUND_UP_P is true, the result is round up rather than to zero when
    optimizing for speed.  */
-static unsigned
-adjust_setup_cost (struct ivopts_data *data, unsigned cost,
+static int64_t
+adjust_setup_cost (struct ivopts_data *data, int64_t cost,
 		   bool round_up_p = false)
 {
   if (cost == INFTY)
     return cost;
   else if (optimize_loop_for_speed_p (data->current_loop))
     {
-      HOST_WIDE_INT niters = avg_loop_niter (data->current_loop);
-      return ((HOST_WIDE_INT) cost + (round_up_p ? niters - 1 : 0)) / niters;
+      int64_t niters = (int64_t) avg_loop_niter (data->current_loop);
+      return (cost + (round_up_p ? niters - 1 : 0)) / niters;
     }
   else
     return cost;
@@ -4194,6 +4308,36 @@ force_expr_to_var_cost (tree expr, bool speed)
       STRIP_NOPS (op0);
       op1 = NULL_TREE;
       break;
+    /* See add_iv_candidate_for_doloop, for doloop may_be_zero case, we
+       introduce COND_EXPR for IV base, need to support better cost estimation
+       for this COND_EXPR and tcc_comparison.  */
+    case COND_EXPR:
+      op0 = TREE_OPERAND (expr, 1);
+      STRIP_NOPS (op0);
+      op1 = TREE_OPERAND (expr, 2);
+      STRIP_NOPS (op1);
+      break;
+    case LT_EXPR:
+    case LE_EXPR:
+    case GT_EXPR:
+    case GE_EXPR:
+    case EQ_EXPR:
+    case NE_EXPR:
+    case UNORDERED_EXPR:
+    case ORDERED_EXPR:
+    case UNLT_EXPR:
+    case UNLE_EXPR:
+    case UNGT_EXPR:
+    case UNGE_EXPR:
+    case UNEQ_EXPR:
+    case LTGT_EXPR:
+    case MAX_EXPR:
+    case MIN_EXPR:
+      op0 = TREE_OPERAND (expr, 0);
+      STRIP_NOPS (op0);
+      op1 = TREE_OPERAND (expr, 1);
+      STRIP_NOPS (op1);
+      break;
 
     default:
       /* Just an arbitrary value, FIXME.  */
@@ -4275,6 +4419,35 @@ force_expr_to_var_cost (tree expr, bool speed)
     case RSHIFT_EXPR:
       cost = comp_cost (add_cost (speed, mode), 0);
       break;
+    case COND_EXPR:
+      op0 = TREE_OPERAND (expr, 0);
+      STRIP_NOPS (op0);
+      if (op0 == NULL_TREE || TREE_CODE (op0) == SSA_NAME
+	  || CONSTANT_CLASS_P (op0))
+	cost = no_cost;
+      else
+	cost = force_expr_to_var_cost (op0, speed);
+      break;
+    case LT_EXPR:
+    case LE_EXPR:
+    case GT_EXPR:
+    case GE_EXPR:
+    case EQ_EXPR:
+    case NE_EXPR:
+    case UNORDERED_EXPR:
+    case ORDERED_EXPR:
+    case UNLT_EXPR:
+    case UNLE_EXPR:
+    case UNGT_EXPR:
+    case UNGE_EXPR:
+    case UNEQ_EXPR:
+    case LTGT_EXPR:
+    case MAX_EXPR:
+    case MIN_EXPR:
+      /* Simply use add cost for now, FIXME if there is some more accurate cost
+	 evaluation way.  */
+      cost = comp_cost (add_cost (speed, mode), 0);
+      break;
 
     default:
       gcc_unreachable ();
@@ -4315,7 +4488,7 @@ enum ainc_type
 
 struct ainc_cost_data
 {
-  unsigned costs[AINC_NONE];
+  int64_t costs[AINC_NONE];
 };
 
 static comp_cost
@@ -4567,22 +4740,25 @@ get_address_cost (struct ivopts_data *data, struct iv_use *use,
 static comp_cost
 get_scaled_computation_cost_at (ivopts_data *data, gimple *at, comp_cost cost)
 {
-   int loop_freq = data->current_loop->header->count.to_frequency (cfun);
-   int bb_freq = gimple_bb (at)->count.to_frequency (cfun);
-   if (loop_freq != 0)
-     {
-       gcc_assert (cost.scratch <= cost.cost);
-       int scaled_cost
-	 = cost.scratch + (cost.cost - cost.scratch) * bb_freq / loop_freq;
+  if (data->speed
+      && data->current_loop->header->count.to_frequency (cfun) > 0)
+    {
+      basic_block bb = gimple_bb (at);
+      gcc_assert (cost.scratch <= cost.cost);
+      int scale_factor = (int)(intptr_t) bb->aux;
+      if (scale_factor == 1)
+	return cost;
 
-       if (dump_file && (dump_flags & TDF_DETAILS))
-	 fprintf (dump_file, "Scaling cost based on bb prob "
-		  "by %2.2f: %d (scratch: %d) -> %d (%d/%d)\n",
-		  1.0f * bb_freq / loop_freq, cost.cost,
-		  cost.scratch, scaled_cost, bb_freq, loop_freq);
+      int64_t scaled_cost
+	= cost.scratch + (cost.cost - cost.scratch) * scale_factor;
 
-       cost.cost = scaled_cost;
-     }
+      if (dump_file && (dump_flags & TDF_DETAILS))
+	fprintf (dump_file, "Scaling cost based on bb prob by %2.2f: "
+		 "%" PRId64 " (scratch: %" PRId64 ") -> %" PRId64 "\n",
+		 1.0f * scale_factor, cost.cost, cost.scratch, scaled_cost);
+
+      cost.cost = scaled_cost;
+    }
 
   return cost;
 }
@@ -4648,7 +4824,10 @@ get_computation_cost (struct ivopts_data *data, struct iv_use *use,
     {
       cost = get_address_cost (data, use, cand, &aff_inv, &aff_var, ratio,
 			       inv_vars, inv_expr, can_autoinc, speed);
-      return get_scaled_computation_cost_at (data, at, cost);
+      cost = get_scaled_computation_cost_at (data, at, cost);
+      /* For doloop IV cand, add on the extra cost.  */
+      cost += cand->doloop_p ? targetm.doloop_cost_for_address : 0;
+      return cost;
     }
 
   bool simple_inv = (aff_combination_const_p (&aff_inv)
@@ -4698,7 +4877,13 @@ get_computation_cost (struct ivopts_data *data, struct iv_use *use,
   if (comp_inv && !integer_zerop (comp_inv))
     cost += add_cost (speed, TYPE_MODE (utype));
 
-  return get_scaled_computation_cost_at (data, at, cost);
+  cost = get_scaled_computation_cost_at (data, at, cost);
+
+  /* For doloop IV cand, add on the extra cost.  */
+  if (cand->doloop_p && use->type == USE_NONLINEAR_EXPR)
+    cost += targetm.doloop_cost_for_generic;
+
+  return cost;
 }
 
 /* Determines cost of computing the use in GROUP with CAND in a generic
@@ -4838,9 +5023,7 @@ iv_period (struct iv *iv)
      i.e., N*type_range/step - 1. Since type range is power
      of two, N == (step >> num_of_ending_zeros_binary (step),
      so the final result is
-
        (type_range >> num_of_ending_zeros_binary (step)) - 1
-
   */
   pow2div = num_ending_zeros (step);
 
@@ -4871,7 +5054,6 @@ iv_elimination_compare (struct ivopts_data *data, struct iv_use *use)
 /* Returns true if we can prove that BASE - OFFSET does not overflow.  For now,
    we only detect the situation that BASE = SOMETHING + OFFSET, where the
    calculation is performed in non-wrapping type.
-
    TODO: More generally, we could test for the situation that
 	 BASE = SOMETHING + OFFSET' and OFFSET is between OFFSET' and zero.
 	 This would require knowing the sign of OFFSET.  */
@@ -4941,15 +5123,11 @@ difference_cannot_overflow_p (struct ivopts_data *data, tree base, tree offset)
 /* Tries to replace loop exit by one formulated in terms of a LT_EXPR
    comparison with CAND.  NITER describes the number of iterations of
    the loops.  If successful, the comparison in COMP_P is altered accordingly.
-
    We aim to handle the following situation:
-
    sometype *base, *p;
    int a, b, i;
-
    i = a;
    p = p_0 = base + a;
-
    do
      {
        bla (*p);
@@ -4957,10 +5135,8 @@ difference_cannot_overflow_p (struct ivopts_data *data, tree base, tree offset)
        i++;
      }
    while (i < b);
-
    Here, the number of iterations of the loop is (a + 1 > b) ? 0 : b - a - 1.
    We aim to optimize this to
-
    p = p_0 = base + a;
    do
      {
@@ -4968,10 +5144,8 @@ difference_cannot_overflow_p (struct ivopts_data *data, tree base, tree offset)
        p++;
      }
    while (p < p_0 - a + b);
-
    This preserves the correctness, since the pointer arithmetics does not
    overflow.  More precisely:
-
    1) if a + 1 <= b, then p_0 - a + b is the final value of p, hence there is no
       overflow in computing it or the values of p.
    2) if a + 1 > b, then we need to verify that the expression p_0 - a does not
@@ -5156,6 +5330,15 @@ may_eliminate_iv (struct ivopts_data *data,
 	}
     }
 
+  /* For doloop IV cand, the bound would be zero.  It's safe whether
+     may_be_zero set or not.  */
+  if (cand->doloop_p)
+    {
+      *bound = build_int_cst (TREE_TYPE (cand->iv->base), 0);
+      *comp = iv_elimination_compare (data, use);
+      return true;
+    }
+
   cand_value_at (loop, cand, use->stmt, desc->niter, &bnd);
 
   *bound = fold_convert (TREE_TYPE (cand->iv->base),
@@ -5170,7 +5353,6 @@ may_eliminate_iv (struct ivopts_data *data,
   /* Sometimes, it is possible to handle the situation that the number of
      iterations may be zero unless additional assumptions by using <
      instead of != in the exit condition.
-
      TODO: we could also calculate the value MAY_BE_ZERO ? 0 : NITER and
 	   base the exit condition on it.  However, that is often too
 	   expensive.  */
@@ -5247,7 +5429,6 @@ determine_group_iv_cost_cond (struct ivopts_data *data,
 
   /* When the condition is a comparison of the candidate IV against
      zero, prefer this IV.
-
      TODO: The constant that we're subtracting from the cost should
      be target-dependent.  This information should be added to the
      target costs for each backend.  */
@@ -5278,6 +5459,9 @@ determine_group_iv_cost_cond (struct ivopts_data *data,
       inv_vars = inv_vars_elim;
       inv_vars_elim = NULL;
       inv_expr = inv_expr_elim;
+      /* For doloop candidate/use pair, adjust to zero cost.  */
+      if (group->doloop_p && cand->doloop_p && elim_cost.cost > no_cost.cost)
+	cost = no_cost;
     }
   else
     {
@@ -5404,6 +5588,42 @@ relate_compare_use_with_all_cands (struct ivopts_data *data)
     }
 }
 
+/* Add one doloop dedicated IV candidate:
+     - Base is (may_be_zero ? 1 : (niter + 1)).
+     - Step is -1.  */
+
+static void
+add_iv_candidate_for_doloop (struct ivopts_data *data)
+{
+  tree_niter_desc *niter_desc = niter_for_single_dom_exit (data);
+  gcc_assert (niter_desc && niter_desc->assumptions);
+
+  tree niter = niter_desc->niter;
+  tree ntype = TREE_TYPE (niter);
+  gcc_assert (TREE_CODE (ntype) == INTEGER_TYPE);
+
+  tree may_be_zero = niter_desc->may_be_zero;
+  if (may_be_zero && integer_zerop (may_be_zero))
+    may_be_zero = NULL_TREE;
+  if (may_be_zero)
+    {
+      if (COMPARISON_CLASS_P (may_be_zero))
+	{
+	  niter = fold_build3 (COND_EXPR, ntype, may_be_zero,
+			       build_int_cst (ntype, 0),
+			       rewrite_to_non_trapping_overflow (niter));
+	}
+      /* Don't try to obtain the iteration count expression when may_be_zero is
+	 integer_nonzerop (actually iteration count is one) or else.  */
+      else
+	return;
+    }
+
+  tree base = fold_build2 (PLUS_EXPR, ntype, unshare_expr (niter),
+			   build_int_cst (ntype, 1));
+  add_candidate (data, base, build_int_cst (ntype, -1), true, NULL, NULL, true);
+}
+
 /* Finds the candidates for the induction variables.  */
 
 static void
@@ -5411,6 +5631,10 @@ find_iv_candidates (struct ivopts_data *data)
 {
   /* Add commonly used ivs.  */
   add_standard_iv_candidates (data);
+
+  /* Add doloop dedicated ivs.  */
+  if (data->doloop_use_p)
+    add_iv_candidate_for_doloop (data);
 
   /* Add old induction variables.  */
   add_iv_candidate_for_bivs (data);
@@ -5546,7 +5770,7 @@ determine_group_iv_costs (struct ivopts_data *data)
 		  || group->cost_map[j].cost.infinite_cost_p ())
 		continue;
 
-	      fprintf (dump_file, "  %d\t%d\t%d\t",
+	      fprintf (dump_file, "  %d\t%" PRId64 "\t%d\t",
 		       group->cost_map[j].cand->id,
 		       group->cost_map[j].cost.cost,
 		       group->cost_map[j].cost.complexity);
@@ -5592,16 +5816,21 @@ determine_iv_cost (struct ivopts_data *data, struct iv_cand *cand)
      or a const set.  */
   if (cost_base.cost == 0)
     cost_base.cost = COSTS_N_INSNS (1);
-  cost_step = add_cost (data->speed, TYPE_MODE (TREE_TYPE (base)));
-
+  /* Doloop decrement should be considered as zero cost.  */
+  if (cand->doloop_p)
+    cost_step = 0;
+  else
+    cost_step = add_cost (data->speed, TYPE_MODE (TREE_TYPE (base)));
   cost = cost_step + adjust_setup_cost (data, cost_base.cost);
 
   /* Prefer the original ivs unless we may gain something by replacing it.
      The reason is to make debugging simpler; so this is not relevant for
      artificial ivs created by other optimization passes.  */
-  if (cand->pos != IP_ORIGINAL
-      || !SSA_NAME_VAR (cand->var_before)
-      || DECL_ARTIFICIAL (SSA_NAME_VAR (cand->var_before)))
+  if ((cand->pos != IP_ORIGINAL
+       || !SSA_NAME_VAR (cand->var_before)
+       || DECL_ARTIFICIAL (SSA_NAME_VAR (cand->var_before)))
+      /* Prefer doloop as well.  */
+      && !cand->doloop_p)
     cost++;
 
   /* Prefer not to insert statements into latch unless there are some
@@ -5846,7 +6075,8 @@ iv_ca_set_no_cp (struct ivopts_data *data, struct iv_ca *ivs,
   if (ivs->n_cand_uses[cid] == 0)
     {
       bitmap_clear_bit (ivs->cands, cid);
-      ivs->n_cands--;
+      if (!cp->cand->doloop_p || !targetm.have_count_reg_decr_p)
+	      ivs->n_cands--;
       ivs->cand_cost -= cp->cand->cost;
       iv_ca_set_remove_invs (ivs, cp->cand->inv_vars, ivs->n_inv_var_uses);
       iv_ca_set_remove_invs (ivs, cp->cand->inv_exprs, ivs->n_inv_expr_uses);
@@ -5903,7 +6133,8 @@ iv_ca_set_cp (struct ivopts_data *data, struct iv_ca *ivs,
       if (ivs->n_cand_uses[cid] == 1)
 	{
 	  bitmap_set_bit (ivs->cands, cid);
-	  ivs->n_cands++;
+	  if (!cp->cand->doloop_p || !targetm.have_count_reg_decr_p)
+	    ivs->n_cands++;
 	  ivs->cand_cost += cp->cand->cost;
 	  iv_ca_set_add_invs (ivs, cp->cand->inv_vars, ivs->n_inv_var_uses);
 	  iv_ca_set_add_invs (ivs, cp->cand->inv_exprs, ivs->n_inv_expr_uses);
@@ -6146,11 +6377,13 @@ iv_ca_dump (struct ivopts_data *data, FILE *file, struct iv_ca *ivs)
   unsigned i;
   comp_cost cost = iv_ca_cost (ivs);
 
-  fprintf (file, "  cost: %d (complexity %d)\n", cost.cost,
+  fprintf (file, "  cost: %" PRId64 " (complexity %d)\n", cost.cost,
 	   cost.complexity);
-  fprintf (file, "  cand_cost: %d\n  cand_group_cost: %d (complexity %d)\n",
-	   ivs->cand_cost, ivs->cand_use_cost.cost,
-	   ivs->cand_use_cost.complexity);
+  fprintf (file, "  reg_cost: %d\n",
+	   ivopts_estimate_reg_pressure (data, ivs->n_invs, ivs->n_cands));
+  fprintf (file, "  cand_cost: %" PRId64 "\n  cand_group_cost: "
+	   "%" PRId64 " (complexity %d)\n", ivs->cand_cost,
+	   ivs->cand_use_cost.cost, ivs->cand_use_cost.complexity);
   bitmap_print (file, ivs->cands, "  candidates: ","\n");
 
   for (i = 0; i < ivs->upto; i++)
@@ -6158,9 +6391,9 @@ iv_ca_dump (struct ivopts_data *data, FILE *file, struct iv_ca *ivs)
       struct iv_group *group = data->vgroups[i];
       struct cost_pair *cp = iv_ca_cand_for_group (ivs, group);
       if (cp)
-        fprintf (file, "   group:%d --> iv_cand:%d, cost=(%d,%d)\n",
-		 group->id, cp->cand->id, cp->cost.cost,
-		 cp->cost.complexity);
+        fprintf (file, "   group:%d --> iv_cand:%d, cost=("
+		 "%" PRId64 ",%d)\n", group->id, cp->cand->id,
+		 cp->cost.cost, cp->cost.complexity);
       else
 	fprintf (file, "   group:%d --> ??\n", group->id);
     }
@@ -6688,9 +6921,8 @@ try_improve_iv_set (struct ivopts_data *data,
     }
 
   iv_ca_delta_commit (data, ivs, best_delta, true);
-  gcc_assert (best_cost == iv_ca_cost (ivs));
   iv_ca_delta_free (&best_delta);
-  return true;
+  return best_cost == iv_ca_cost (ivs);
 }
 
 /* Attempts to find the optimal set of induction variables.  We do simple
@@ -6727,6 +6959,14 @@ find_optimal_iv_set_1 (struct ivopts_data *data, bool originalp)
 	}
     }
 
+  /* If the set has infinite_cost, it can't be optimal.  */
+  if (iv_ca_cost (set).infinite_cost_p ())
+    {
+      if (dump_file && (dump_flags & TDF_DETAILS))
+	fprintf (dump_file,
+		 "Overflow to infinite cost in try_improve_iv_set.\n");
+      iv_ca_free (&set);
+    }
   return set;
 }
 
@@ -6751,9 +6991,9 @@ find_optimal_iv_set (struct ivopts_data *data)
 
   if (dump_file && (dump_flags & TDF_DETAILS))
     {
-      fprintf (dump_file, "Original cost %d (complexity %d)\n\n",
+      fprintf (dump_file, "Original cost %" PRId64 " (complexity %d)\n\n",
 	       origcost.cost, origcost.complexity);
-      fprintf (dump_file, "Final cost %d (complexity %d)\n\n",
+      fprintf (dump_file, "Final cost %" PRId64 " (complexity %d)\n\n",
 	       cost.cost, cost.complexity);
     }
 
@@ -7016,21 +7256,14 @@ rewrite_use_nonlinear_expr (struct ivopts_data *data,
    a mem ref to enable instruction combining in later phases. The mem ref uses
    the iv value before the update, so the reordering transformation requires
    adjustment of the offset. CAND is the selected IV_CAND.
-
    Example:
-
    t = MEM_REF (base, iv1, 8, 16);  // base, index, stride, offset
    iv2 = iv1 + 1;
-
    if (t < val)      (1)
      goto L;
    goto Head;
-
-
    directly propagating t over to (1) will introduce overlapping live range
    thus increase register pressure. This peephole transform it into:
-
-
    iv2 = iv1 + 1;
    t = MEM_REF (base, iv2, 8, 8);
    if (t < val)
@@ -7134,7 +7367,6 @@ rewrite_use_address (struct ivopts_data *data,
      integer types.  The drawback is that this makes it impossible for
      create_mem_ref to distinguish an IV that is based on a memory object
      from one that represents simply an offset.
-
      To work around this problem, we pass a hint to create_mem_ref that
      indicates which variable (if any) in aff is an IV based on a memory
      object.  Note that we only consider the candidate.  If this is not
@@ -7534,6 +7766,120 @@ loop_body_includes_call (basic_block *body, unsigned num_nodes)
   return false;
 }
 
+/* Determine cost scaling factor for basic blocks in loop.  */
+#define COST_SCALING_FACTOR_BOUND (20)
+
+static void
+determine_scaling_factor (struct ivopts_data *data, basic_block *body)
+{
+  int lfreq = data->current_loop->header->count.to_frequency (cfun);
+  if (!data->speed || lfreq <= 0)
+    return;
+
+  int max_freq = lfreq;
+  for (unsigned i = 0; i < data->current_loop->num_nodes; i++)
+    {
+      body[i]->aux = (void *)(intptr_t) 1;
+      if (max_freq < body[i]->count.to_frequency (cfun))
+	max_freq = body[i]->count.to_frequency (cfun);
+    }
+  if (max_freq > lfreq)
+    {
+      int divisor, factor;
+      /* Check if scaling factor itself needs to be scaled by the bound.  This
+	 is to avoid overflow when scaling cost according to profile info.  */
+      if (max_freq / lfreq > COST_SCALING_FACTOR_BOUND)
+	{
+	  divisor = max_freq;
+	  factor = COST_SCALING_FACTOR_BOUND;
+	}
+      else
+	{
+	  divisor = lfreq;
+	  factor = 1;
+	}
+      for (unsigned i = 0; i < data->current_loop->num_nodes; i++)
+	{
+	  int bfreq = body[i]->count.to_frequency (cfun);
+	  if (bfreq <= lfreq)
+	    continue;
+
+	  body[i]->aux = (void*)(intptr_t) (factor * bfreq / divisor);
+	}
+    }
+}
+
+/* Find doloop comparison use and set its doloop_p on if found.  */
+
+static bool
+find_doloop_use (struct ivopts_data *data)
+{
+  struct loop *loop = data->current_loop;
+
+  for (unsigned i = 0; i < data->vgroups.length (); i++)
+    {
+      struct iv_group *group = data->vgroups[i];
+      if (group->type == USE_COMPARE)
+	{
+	  gcc_assert (group->vuses.length () == 1);
+	  struct iv_use *use = group->vuses[0];
+	  gimple *stmt = use->stmt;
+	  if (gimple_code (stmt) == GIMPLE_COND)
+	    {
+	      basic_block bb = gimple_bb (stmt);
+	      edge true_edge, false_edge;
+	      extract_true_false_edges_from_block (bb, &true_edge, &false_edge);
+	      /* This comparison is used for loop latch.  Require latch is empty
+		 for now.  */
+	      if ((loop->latch == true_edge->dest
+		   || loop->latch == false_edge->dest)
+		  && empty_block_p (loop->latch))
+		{
+		  group->doloop_p = true;
+		  if (dump_file && (dump_flags & TDF_DETAILS))
+		    {
+		      fprintf (dump_file, "Doloop cmp iv use: ");
+		      print_gimple_stmt (dump_file, stmt, TDF_DETAILS);
+		    }
+		  return true;
+		}
+	    }
+	}
+    }
+
+  return false;
+}
+
+/* For the targets which support doloop, to predict whether later RTL doloop
+   transformation will perform on this loop, further detect the doloop use and
+   mark the flag doloop_use_p if predicted.  */
+
+void
+analyze_and_mark_doloop_use (struct ivopts_data *data)
+{
+  data->doloop_use_p = false;
+
+  if (!flag_branch_on_count_reg)
+    return;
+
+  if (!generic_predict_doloop_p (data))
+    return;
+
+  if (find_doloop_use (data))
+    {
+      data->doloop_use_p = true;
+      if (dump_file && (dump_flags & TDF_DETAILS))
+	{
+	  struct loop *loop = data->current_loop;
+	  fprintf (dump_file,
+		   "Predict loop %d can perform"
+		   " doloop optimization later.\n",
+		   loop->num);
+	  flow_loop_dump (loop, dump_file, NULL, 1);
+	}
+    }
+}
+
 /* Optimizes the LOOP.  Returns true if anything changed.  */
 
 static bool
@@ -7572,7 +7918,6 @@ tree_ssa_iv_optimize_loop (struct ivopts_data *data, struct loop *loop,
   body = get_loop_body (loop);
   data->body_includes_call = loop_body_includes_call (body, loop->num_nodes);
   renumber_gimple_stmt_uids_in_blocks (body, loop->num_nodes);
-  free (body);
 
   data->loop_single_exit_p = exit != NULL && loop_only_exit_p (loop, exit);
 
@@ -7586,6 +7931,12 @@ tree_ssa_iv_optimize_loop (struct ivopts_data *data, struct loop *loop,
   if (data->vgroups.length () > MAX_CONSIDERED_GROUPS)
     goto finish;
 
+  /* Determine cost scaling factor for basic blocks in loop.  */
+  determine_scaling_factor (data, body);
+
+  /* Analyze doloop possibility and mark the doloop use if predicted.  */
+  analyze_and_mark_doloop_use (data);
+
   /* Finds candidates for the induction variables (item 2).  */
   find_iv_candidates (data);
 
@@ -7596,6 +7947,9 @@ tree_ssa_iv_optimize_loop (struct ivopts_data *data, struct loop *loop,
 
   /* Find the optimal set of induction variables (item 3, part 2).  */
   iv_ca = find_optimal_iv_set (data);
+  /* Cleanup basic block aux field.  */
+  for (unsigned i = 0; i < data->current_loop->num_nodes; i++)
+    body[i]->aux = NULL;
   if (!iv_ca)
     goto finish;
   changed = true;
@@ -7611,6 +7965,7 @@ tree_ssa_iv_optimize_loop (struct ivopts_data *data, struct loop *loop,
   remove_unused_ivs (data, toremove);
 
 finish:
+  free (body);
   free_loop_data (data);
 
   return changed;
